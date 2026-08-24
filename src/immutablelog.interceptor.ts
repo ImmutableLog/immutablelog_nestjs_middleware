@@ -55,6 +55,29 @@ function resolveKind(status: number): 'success' | 'info' | 'error' {
   return 'error';
 }
 
+/**
+ * Route template (`/users/:id`) of the matched route. The interceptor runs after
+ * routing, so the underlying Express request already carries `route.path`;
+ * `baseUrl` is prefixed so controllers mounted under a prefix keep the full path.
+ * Falls back to the concrete path when no route was resolved.
+ */
+function resolveRouteTemplate(req: Request, concretePath: string): string {
+  const routePath = req.route?.path as string | undefined;
+  if (!routePath) return concretePath;
+  return `${req.baseUrl ?? ''}${routePath}` || concretePath;
+}
+
+/**
+ * Maps the event kind to the `log.level` vocabulary of `meta.log_level`
+ * (promoted to ECS `log.level` by the SIEM). This interceptor only produces
+ * success | info | error; `success` collapses into `info` because ECS has no
+ * "success" level. Same mapping as the official SDK
+ * (error -> error, warning -> warn, debug -> debug, rest -> info).
+ */
+function resolveLogLevel(kind: 'success' | 'info' | 'error'): string {
+  return kind === 'error' ? 'error' : 'info';
+}
+
 function getClientIp(req: Request): string {
   const forwarded = req.headers['x-forwarded-for'];
   if (forwarded) {
@@ -92,9 +115,35 @@ async function emitEvent(
   env: string,
   requestId: string,
   eventName: string,
+  httpRoute: string,
   payloadObj: EventPayload,
 ): Promise<void> {
   const payloadStr = clampPayload(payloadObj);
+
+  // Reserved `meta` keys asserted by the tenant (CONTRACT.md 4.1). All values are
+  // strings: the core only accepts meta as HashMap<String, String>.
+  const meta: Record<string, string> = {
+    type: payloadObj.kind,
+    event_name: eventName,
+    service: serviceName,
+    request_id: requestId,
+    // `environment` is the canonical name; `env` is kept for backwards compatibility
+    // with clients already reading it.
+    environment: env,
+    env,
+    log_level: resolveLogLevel(payloadObj.kind),
+    http_method: payloadObj.request.method,
+    // `http_status` must be a string of digits, never a number.
+    http_status: String(payloadObj.metrics.statusCode),
+    http_route: httpRoute,
+  };
+
+  const clientIp = payloadObj.context.ip;
+  if (clientIp && clientIp !== 'unknown') meta.client_ip = clientIp;
+  if (payloadObj.error?.exception) meta.error_type = payloadObj.error.exception;
+  if (payloadObj.error?.exceptionMessage) {
+    meta.error_message = payloadObj.error.exceptionMessage.slice(0, 500);
+  }
 
   await fetch(`${apiUrl}/v1/events`, {
     method: 'POST',
@@ -106,13 +155,7 @@ async function emitEvent(
     },
     body: JSON.stringify({
       payload: payloadStr,
-      meta: {
-        type: payloadObj.kind,
-        event_name: eventName,
-        service: serviceName,
-        request_id: requestId,
-        env,
-      },
+      meta,
     }),
   });
 }
@@ -163,6 +206,7 @@ export class ImmutableLogInterceptor implements NestInterceptor {
         const kind = resolveKind(status);
         const method = req.method.toUpperCase();
         const eventName = eventNameMeta ?? `http.${method}.${path}`;
+        const httpRoute = resolveRouteTemplate(req, path);
 
         const payloadObj: EventPayload = {
           id: randomUUID(),
@@ -179,7 +223,7 @@ export class ImmutableLogInterceptor implements NestInterceptor {
           payloadObj.error = { retryable: RETRYABLE_STATUSES.has(status) };
         }
 
-        emitEvent(this.apiKey, this.apiUrl, this.serviceName, this.env, requestId, eventName, payloadObj).catch((err) => {
+        emitEvent(this.apiKey, this.apiUrl, this.serviceName, this.env, requestId, eventName, httpRoute, payloadObj).catch((err) => {
           console.warn('[ImmutableLog] Failed to emit event:', err?.message ?? err);
         });
       }),
@@ -188,6 +232,7 @@ export class ImmutableLogInterceptor implements NestInterceptor {
         const latencyMs = Date.now() - startedAt;
         const method = req.method.toUpperCase();
         const eventName = eventNameMeta ?? `http.${method}.${path}`;
+        const httpRoute = resolveRouteTemplate(req, path);
 
         const payloadObj: EventPayload = {
           id: randomUUID(),
@@ -205,7 +250,7 @@ export class ImmutableLogInterceptor implements NestInterceptor {
           severity: 'high',
         };
 
-        emitEvent(this.apiKey, this.apiUrl, this.serviceName, this.env, requestId, eventName, payloadObj).catch((e) => {
+        emitEvent(this.apiKey, this.apiUrl, this.serviceName, this.env, requestId, eventName, httpRoute, payloadObj).catch((e) => {
           console.warn('[ImmutableLog] Failed to emit error event:', e?.message ?? e);
         });
 
