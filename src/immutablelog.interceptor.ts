@@ -95,17 +95,18 @@ function clampPayload(payloadObj: EventPayload): string {
   serialized = JSON.stringify(trimmed);
   if (Buffer.byteLength(serialized, 'utf8') <= MAX_PAYLOAD_BYTES) return serialized;
 
+  // Bound every retained string; JSON escaping can use up to six bytes per
+  // code unit. These caps keep the fallback well below MAX_PAYLOAD_BYTES.
   const minimal = {
-    id: payloadObj.id,
+    id: payloadObj.id.slice(0, 128),
     kind: payloadObj.kind,
-    message: payloadObj.message,
-    timestamp: payloadObj.timestamp,
-    context: payloadObj.context,
-    request: payloadObj.request,
-    metrics: payloadObj.metrics,
-    severity: payloadObj.severity,
+    message: payloadObj.message.slice(0, 500),
+    timestamp: payloadObj.timestamp.slice(0, 64),
   };
-  return JSON.stringify(minimal);
+  serialized = JSON.stringify(minimal);
+  return Buffer.byteLength(serialized, 'utf8') <= MAX_PAYLOAD_BYTES
+    ? serialized
+    : JSON.stringify({ kind: payloadObj.kind, message: 'Event payload exceeded size limit' });
 }
 
 async function emitEvent(
@@ -145,7 +146,7 @@ async function emitEvent(
     meta.error_message = payloadObj.error.exceptionMessage.slice(0, 500);
   }
 
-  await fetch(`${apiUrl}/v1/events`, {
+  const response = await fetch(`${apiUrl}/v1/events`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -158,6 +159,9 @@ async function emitEvent(
       meta,
     }),
   });
+  if (!response.ok) {
+    console.warn('[ImmutableLog] Event rejected by API: HTTP', response.status);
+  }
 }
 
 @Injectable()
