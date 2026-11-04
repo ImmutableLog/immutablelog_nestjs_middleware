@@ -8,6 +8,7 @@ import { Reflector } from '@nestjs/core';
 import { Observable, throwError } from 'rxjs';
 import { tap, catchError } from 'rxjs/operators';
 import { randomUUID } from 'crypto';
+import { isIP } from 'node:net';
 import { Request, Response } from 'express';
 
 export const IMTBL_EVENT_NAME = 'imtbl:eventName';
@@ -26,7 +27,7 @@ interface EventPayload {
   message: string;
   timestamp: string;
   context: {
-    ip: string;
+    ip?: string;
     userAgent: string;
   };
   request: {
@@ -78,12 +79,38 @@ function resolveLogLevel(kind: 'success' | 'info' | 'error'): string {
   return kind === 'error' ? 'error' : 'info';
 }
 
-function getClientIp(req: Request): string {
+/**
+ * Client IP for `client_ip`: the first X-Forwarded-For entry when it is a valid IP, otherwise
+ * the IP of the connection (`req.socket.remoteAddress`). Returns undefined when neither is a valid
+ * IP, and then `client_ip` is omitted from meta and from the payload: the SIEM only promotes a
+ * bare IP (no port) to `source.ip` and silently drops anything else. X-Forwarded-For is only
+ * trustworthy behind a proxy/ALB that overwrites it: without one, any caller can forge it.
+ */
+function getClientIp(req: Request): string | undefined {
   const forwarded = req.headers['x-forwarded-for'];
   if (forwarded) {
-    return (Array.isArray(forwarded) ? forwarded[0] : forwarded).split(',')[0].trim();
+    const ip = bareIp((Array.isArray(forwarded) ? forwarded[0] : forwarded).split(',')[0]);
+    if (ip) return ip;
   }
-  return req.socket?.remoteAddress ?? 'unknown';
+  return bareIp(req.socket?.remoteAddress);
+}
+
+/**
+ * Trims `value`, strips a port (`10.0.0.1:8080`, `[2001:db8::1]:8080`) or brackets
+ * (`[2001:db8::1]`) and returns the bare IP, or undefined if it is not one. Validated with
+ * `net.isIP` (no DNS). Zone IDs (`fe80::1%eth0`) are rejected: the SIEM only parses a bare IP.
+ */
+function bareIp(value: string | undefined): string | undefined {
+  let v = (value ?? '').trim();
+  if (v.startsWith('[')) {
+    const end = v.indexOf(']');
+    const rest = end < 0 ? null : v.slice(end + 1);
+    if (rest === null || !(rest === '' || /^:\d+$/.test(rest))) return undefined;
+    v = v.slice(1, end);
+  } else if (v.indexOf(':') > 0 && v.indexOf(':') === v.lastIndexOf(':')) {
+    v = v.slice(0, v.indexOf(':'));
+  }
+  return isIP(v) !== 0 && !v.includes('%') ? v : undefined;
 }
 
 function clampPayload(payloadObj: EventPayload): string {
@@ -140,7 +167,7 @@ async function emitEvent(
   };
 
   const clientIp = payloadObj.context.ip;
-  if (clientIp && clientIp !== 'unknown') meta.client_ip = clientIp;
+  if (clientIp) meta.client_ip = clientIp;
   if (payloadObj.error?.exception) meta.error_type = payloadObj.error.exception;
   if (payloadObj.error?.exceptionMessage) {
     meta.error_message = payloadObj.error.exceptionMessage.slice(0, 500);
